@@ -1,0 +1,18 @@
+#!/bin/bash
+
+for file in "$@"; do
+    # Extract the filename without extension
+    filename="${file%.*}"
+
+    # Define the output format and file
+    output_format="stl"
+    output="${filename}.${output_format}"
+
+    # Try to convert the file using ASSIMP
+    if assimp export "$file" "$output" ; then
+        echo "Converted $file to $output"
+    else
+        echo "Failed to convert $file or not a supported format"
+    fi
+done
+

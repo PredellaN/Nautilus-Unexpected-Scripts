@@ -1,0 +1,31 @@
+#!/bin/bash
+
+for file in "$@"; do
+    # Extract the filename without extension and the extension
+    filename="${file%.*}"
+    extension="${file##*.}"
+
+    # Check the file extension and set the appropriate conversion format
+    if [ "$extension" = "png" ]; then
+        output_format="jpg"
+        output="${filename}.${output_format}"
+        # Convert PNG to JPG with black background for transparency and set quality to 95%
+        convert "$file" -background black -alpha remove -alpha off -quality 95 "$output"
+    elif [ "$extension" = "jpg" ]; then
+        output_format="png"
+        output="${filename}.${output_format}"
+        # Convert JPG to PNG (quality setting is not applicable for PNG)
+        convert "$file" "$output"
+    else
+        echo "Unsupported file format: $file"
+        continue
+    fi
+
+    # Check if the conversion was successful
+    if [ -f "$output" ]; then
+        echo "Converted $file to $output"
+    else
+        echo "Failed to convert $file"
+    fi
+done
+
