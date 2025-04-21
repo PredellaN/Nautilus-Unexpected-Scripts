@@ -1,0 +1,33 @@
+#!/bin/bash
+
+# Check if any files are provided
+if [ $# -eq 0 ]; then
+  echo "Usage: $0 <image1> <image2> ... <imageN>"
+  exit 1
+fi
+
+# Declare an associative array to store image groups based on suffixes
+declare -A image_groups
+
+# Group images by their suffixes
+for img in "$@"; do
+  suffix="${img: -8:4}"  # Extract the four character suffix from filenames
+  image_groups[$suffix]+="${img} "  # Append filename to the corresponding suffix key
+done
+
+# Process each group to create PSD files
+for suffix in "${!image_groups[@]}"; do
+  images=${image_groups[$suffix]}
+  read -a image_array <<< "$images"  # Convert string to array
+
+  # Create the flattened image layer for current group
+  convert ${image_array[@]} -background none -flatten "/tmp/flattened_${suffix}.png"
+
+  # Create the PSD file with both the flattened layer and original layers
+  convert "/tmp/flattened_${suffix}.png" ${image_array[@]} "result_${suffix}.psd"
+
+  # Clean up the intermediate flattened layer if you don't need it anymore
+  rm "/tmp/flattened_${suffix}.png"
+
+  echo "PSD file created successfully: result_${suffix}.psd"
+done

@@ -1,0 +1,16 @@
+#!/bin/bash
+
+format="heic"
+params="-define heic:preserve-alpha"
+
+for file in "$@"; do
+    filename="${file%.*}"
+    output="${filename}.${format}"
+
+    if heif-enc $file -o $output; then
+        echo "Converted $file to $output"
+    else
+        echo "Failed to convert $file or not a supported format"
+    fi
+done
+

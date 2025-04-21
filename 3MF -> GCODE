@@ -1,0 +1,22 @@
+#!/bin/bash
+APPIMAGE="/home/nicolas/AppImages/prusaslicer.appimage"
+
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+# Process all files passed to the script
+for file in "$@"; do
+    # Get the absolute file path
+    absolute_path=$(realpath "$file")
+
+    # Get the base filename without extension
+    filename="${absolute_path%.*}"
+
+    # Define output format and output file
+    output_format="bgcode"
+    output="${filename}.${output_format}"
+
+    # Run the AppImage with the necessary flags and log errors
+    "$APPIMAGE" -g --output "$output" "$absolute_path"
+done
+

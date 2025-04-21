@@ -1,0 +1,16 @@
+#!/bin/bash
+
+for file in "$@"; do
+    if [[ $file == *.pdf || $file == *PDF ]]; then
+        # Extract the filename without extension
+        filename="${file%.*}"
+
+        # Define the output format and file
+        output="${filename}.svg"
+
+        # Convert the file using ctmconv
+        flatpak run org.inkscape.Inkscape "$file" --export-plain-svg --export-type=svg --export-filename="$output" && echo "Converted $file to $output" || echo "Failed to convert $file"
+    else
+        echo "Skipped non-3DS file $file"
+    fi
+done

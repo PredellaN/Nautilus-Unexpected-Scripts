@@ -1,0 +1,17 @@
+#!/bin/bash
+
+format="jpg"
+params="-background black -alpha remove -alpha off -quality 98"
+
+for file in "$@"; do
+    filename="${file%.*}"
+    output="${filename}.${format}"
+
+    if mogrify -format ${format} ${params} "$file"; then
+        echo "Converted $file to $output"
+    else
+        echo "Failed to convert $file or not a supported format"
+    fi
+done
+
+

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 for file in "$@"; do
-    if [[ $file == *.3ds ]]; then
+    if [[ $file == *.3ds || $file == *.3DS ]]; then
         # Extract the filename without extension
         filename="${file%.*}"
 

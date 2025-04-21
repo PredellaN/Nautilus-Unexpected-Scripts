@@ -12,12 +12,6 @@ except ImportError:
     install('pye57')
     import pye57
 
-try:
-    import open3d as o3d
-except ImportError:
-    install('open3d')
-    import open3d as o3d
-
 import numpy as np
 import struct
 
