@@ -1,10 +1,28 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Check if at least one input video is provided by Nautilus
+# Nautilus “Open With” script to run frame interpolation on each selected video
+
+# Path to your interpolation script
+NAUTILUS_SCRIPT="/home/nicolas/Applications/frame-interpolation-pytorch/nautilus_scripts.py"
+# Desired output FPS
+TARGET_FPS=30
+
+# Make sure at least one file was selected
 if [ $# -eq 0 ]; then
     echo "No video file selected."
     exit 1
 fi
 
-# Call the Python script with all provided arguments
-python3 /home/nicolas/Applications/frame-interpolation-pytorch/nautilus_scripts.py fps "$@" 30
+# Process each selected file
+for VIDEO_PATH in "$@"; do
+    echo "Processing: $VIDEO_PATH"
+    python3 "$NAUTILUS_SCRIPT" fps "$VIDEO_PATH" "$TARGET_FPS"
+    if [ $? -ne 0 ]; then
+        echo "  ✗ Error processing $VIDEO_PATH"
+    else
+        echo "  ✓ Done with $VIDEO_PATH"
+    fi
+done
+
+exit 0
+

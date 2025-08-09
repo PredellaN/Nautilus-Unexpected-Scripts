@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+import os
+import sys
+import struct
+import numpy as np
+import pye57
+
+
+DEFAULT_COLOR = np.array([255, 255, 255], dtype=np.uint8)
+
+
+def convert_e57_to_ply(e57_filename: str, ply_filename: str, fill_missing_colors: bool = True) -> None:
+    """
+    Convert an E57 file to a binary little-endian PLY.
+    If at least one scan has colors:
+      - If fill_missing_colors=True: scans without colors are filled with white (255,255,255).
+      - Else: colors are dropped entirely and XYZ-only PLY is written.
+    """
+    with pye57.E57(e57_filename, "r") as e57:
+        num_scans = e57.scan_count
+
+        points_per_scan = []
+        colors_per_scan = []
+        scans_with_color = []
+        any_scan_has_color = False
+
+        for scan_index in range(num_scans):
+            data = e57.read_scan_raw(scan_index)
+            header = e57.get_header(scan_index)
+
+            # Build point array (N,3)
+            points = np.column_stack([
+                data["cartesianX"],
+                data["cartesianY"],
+                data["cartesianZ"],
+            ])
+
+            # Global transform
+            points_global = e57.to_global(points, header.rotation, header.translation)
+            points_per_scan.append(points_global)
+
+            # Color handling for this scan
+            has_color_keys = all(k in data for k in ("colorRed", "colorGreen", "colorBlue"))
+            scans_with_color.append(has_color_keys)
+            if has_color_keys:
+                any_scan_has_color = True
+                colors = np.column_stack([
+                    data["colorRed"],
+                    data["colorGreen"],
+                    data["colorBlue"],
+                ]).astype(np.uint8, copy=False)
+            else:
+                colors = None
+
+            colors_per_scan.append(colors)
+
+        # Concatenate points
+        all_points = np.vstack(points_per_scan).astype(np.float32, copy=False)
+
+        # Decide final color array
+        write_colors = False
+        if any_scan_has_color:
+            if all(scans_with_color):
+                # All scans have color: stack them directly
+                all_colors = np.vstack(colors_per_scan).astype(np.uint8, copy=False)
+                write_colors = True
+            else:
+                if fill_missing_colors:
+                    # Fill scans without colors with default color
+                    filled_colors = []
+                    for pts, cols, has_cols in zip(points_per_scan, colors_per_scan, scans_with_color):
+                        if has_cols:
+                            filled_colors.append(cols.astype(np.uint8, copy=False))
+                        else:
+                            filled_colors.append(np.broadcast_to(DEFAULT_COLOR, (len(pts), 3)).copy())
+                    all_colors = np.vstack(filled_colors).astype(np.uint8, copy=False)
+                    write_colors = True
+                else:
+                    # Drop colors entirely
+                    all_colors = None
+                    write_colors = False
+        else:
+            all_colors = None
+            write_colors = False
+
+    # Write Binary Little-Endian PLY
+    with open(ply_filename, "wb") as f:
+        # Header
+        f.write(b"ply\n")
+        f.write(b"format binary_little_endian 1.0\n")
+        f.write(f"element vertex {len(all_points)}\n".encode())
+        f.write(b"property float x\n")
+        f.write(b"property float y\n")
+        f.write(b"property float z\n")
+        if write_colors:
+            f.write(b"property uchar red\n")
+            f.write(b"property uchar green\n")
+            f.write(b"property uchar blue\n")
+        f.write(b"end_header\n")
+
+        # Body
+        if write_colors:
+            for p, c in zip(all_points, all_colors): #type: ignore
+                f.write(struct.pack("<fff", float(p[0]), float(p[1]), float(p[2])))
+                # ensure uint8
+                f.write(struct.pack("BBB", int(c[0]), int(c[1]), int(c[2])))
+        else:
+            for p in all_points:
+                f.write(struct.pack("<fff", float(p[0]), float(p[1]), float(p[2])))
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print("Usage: convert_e57_to_ply.py <file1.e57> [<file2.e57> ...]")
+        return 1
+
+    exit_code = 0
+    for file_path in argv[1:]:
+        filename, ext = os.path.splitext(file_path)
+        if ext.lower() != ".e57":
+            print(f"Skipping unsupported file format: {file_path}")
+            continue
+
+        output_file = f"{filename}.ply"
+        try:
+            convert_e57_to_ply(file_path, output_file, fill_missing_colors=True)
+            print(f"Converted {file_path} -> {output_file}")
+        except Exception as e:
+            print(f"Failed to convert {file_path}: {e}")
+            exit_code = 2
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

@@ -1,18 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env python3
+import sys, os, subprocess
 
-for file in "$@"; do
-    # Extract the filename without extension
-    filename="${file%.*}"
+def convert_to_stl(files):
+    for f in files:
+        base, _ = os.path.splitext(f)
+        out = base + ".stl"
+        try:
+            subprocess.run(["assimp", "export", f, out], check=True)
+            print(f"Converted {f} to {out}")
+        except subprocess.CalledProcessError:
+            print(f"Failed to convert {f} or not a supported format")
 
-    # Define the output format and file
-    output_format="stl"
-    output="${filename}.${output_format}"
-
-    # Try to convert the file using ASSIMP
-    if assimp export "$file" "$output" ; then
-        echo "Converted $file to $output"
-    else
-        echo "Failed to convert $file or not a supported format"
-    fi
-done
-
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <files...>")
+        sys.exit(1)
+    convert_to_stl(sys.argv[1:])

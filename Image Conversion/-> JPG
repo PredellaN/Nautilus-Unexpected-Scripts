@@ -13,28 +13,28 @@ except Exception:
     Gtk = None
     Notify = None
 
-EXTENSION = "png"
-SAVE_FORMAT = "PNG"
+EXTENSION = "jpg"
+SAVE_FORMAT = "JPEG"
 
-def ask_compress_and_resize_gnome(default_compress=6):
+def ask_quality_and_resize_gnome(default_quality=95):
     """
-    Returns (compress_level:int[0-9], width:Optional[int], height:Optional[int]) or (None, None, None) on cancel.
-    Defaults: compress_level=6, width=None, height=None.
+    Returns (quality:int, width:Optional[int], height:Optional[int]) or (None, None, None) on cancel.
+    Defaults: quality=95, width=None, height=None.
     """
     if Gtk is None:
         # TTY fallback with defaults
         try:
-            c = input(f"PNG compression level [0-9] (0=fast/large, 9=slow/small, default {default_compress}): ").strip()
-            compress = int(c) if c.isdigit() and 0 <= int(c) <= 9 else default_compress
+            q = input(f"JPEG quality [1-100] (default {default_quality}): ").strip()
+            quality = int(q) if q.isdigit() and 1 <= int(q) <= 100 else default_quality
         except Exception:
-            compress = default_compress
+            quality = default_quality
 
         w_in = input("Resize width (px, blank = keep): ").strip()
         h_in = input("Resize height (px, blank = keep): ").strip()
 
         width = int(w_in) if w_in.isdigit() else None
         height = int(h_in) if h_in.isdigit() else None
-        return compress, width, height
+        return quality, width, height
 
     # GTK flow
     if Notify is not None:
@@ -43,7 +43,7 @@ def ask_compress_and_resize_gnome(default_compress=6):
         except Exception:
             pass
 
-    dialog = Gtk.Dialog(title="PNG Options")
+    dialog = Gtk.Dialog(title="JPEG Options")
     dialog.set_modal(True)
     dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
     dialog.add_button("_OK", Gtk.ResponseType.OK)
@@ -60,14 +60,14 @@ def ask_compress_and_resize_gnome(default_compress=6):
     grid.set_row_spacing(8)
     grid.set_column_spacing(8)
 
-    # Compression level
-    c_label = Gtk.Label(label="PNG compression (0–9):")
-    c_label.set_xalign(0.0)
-    c_adj = Gtk.Adjustment(value=default_compress, lower=0, upper=9, step_increment=1, page_increment=1, page_size=0)
-    c_spin = Gtk.SpinButton()
-    c_spin.set_adjustment(c_adj)
-    c_spin.set_numeric(True)
-    c_spin.set_value(default_compress)
+    # Quality
+    q_label = Gtk.Label(label="JPEG quality (1–100):")
+    q_label.set_xalign(0.0)
+    q_adj = Gtk.Adjustment(value=default_quality, lower=1, upper=100, step_increment=1, page_increment=5, page_size=0)
+    q_spin = Gtk.SpinButton()
+    q_spin.set_adjustment(q_adj)
+    q_spin.set_numeric(True)
+    q_spin.set_value(default_quality)
 
     # Width / Height entries
     w_label = Gtk.Label(label="Width (px, blank = keep):")
@@ -87,11 +87,10 @@ def ask_compress_and_resize_gnome(default_compress=6):
     hint.set_markup(
         "• Leave both blank to skip resizing.\n"
         "• Provide only one value to preserve aspect ratio.\n"
-        "• Provide both to force that exact size.\n"
-        "• Compression: 0 = fastest/larger file, 9 = slowest/smallest file."
+        "• Provide both to force that exact size."
     )
 
-    grid.attach(c_label, 0, 0, 1, 1); grid.attach(c_spin, 1, 0, 1, 1)
+    grid.attach(q_label, 0, 0, 1, 1); grid.attach(q_spin, 1, 0, 1, 1)
     grid.attach(w_label, 0, 1, 1, 1); grid.attach(w_entry, 1, 1, 1, 1)
     grid.attach(h_label, 0, 2, 1, 1); grid.attach(h_entry, 1, 2, 1, 1)
     grid.attach(hint,    0, 3, 2, 1)
@@ -100,7 +99,7 @@ def ask_compress_and_resize_gnome(default_compress=6):
     dialog.show_all()
 
     response = dialog.run()
-    compress = int(c_spin.get_value()) if c_spin.get_value_as_int() is not None else default_compress
+    quality = int(q_spin.get_value()) if q_spin.get_value_as_int() else default_quality
     w_str = w_entry.get_text().strip()
     h_str = h_entry.get_text().strip()
     dialog.destroy()
@@ -110,7 +109,17 @@ def ask_compress_and_resize_gnome(default_compress=6):
 
     width = int(w_str) if w_str.isdigit() else None
     height = int(h_str) if h_str.isdigit() else None
-    return compress, width, height
+    return quality, width, height
+
+def to_jpeg_black_bg(im: Image.Image) -> Image.Image:
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        rgba = im.convert("RGBA")
+        bg = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
+        composited = Image.alpha_composite(bg, rgba)
+        return composited.convert("RGB")
+    if im.mode != "RGB":
+        return im.convert("RGB")
+    return im
 
 def compute_target_size(orig_w: int, orig_h: int, req_w, req_h):
     """
@@ -135,76 +144,60 @@ def compute_target_size(orig_w: int, orig_h: int, req_w, req_h):
 
     return orig_w, orig_h
 
-def prepare_for_resize(im: Image.Image) -> Image.Image:
-    """
-    Convert to a good working mode for high-quality resampling while preserving transparency when present.
-    """
-    if im.mode in ("RGBA", "LA"):
-        return im
-    if im.mode == "P":
-        # If palette image has transparency, keep alpha; else RGB is fine
-        if "transparency" in im.info:
-            return im.convert("RGBA")
-        return im.convert("RGB")
-    if im.mode in ("1",):
-        return im.convert("RGBA")
-    return im  # RGB, L, etc.
-
-def process(path: Path, compress_level: int, req_w, req_h) -> None:
+def process(path: Path, quality: int, req_w, req_h) -> None:
     output = path.with_suffix(f".{EXTENSION}")
     try:
         with Image.open(path) as im:
             if getattr(im, "is_animated", False):
                 im.seek(0)
 
+            # Compute target size before converting to RGB
             orig_w, orig_h = im.size
             tgt_w, tgt_h = compute_target_size(orig_w, orig_h, req_w, req_h)
-
-            work = im
             if (tgt_w, tgt_h) != (orig_w, orig_h):
-                work = prepare_for_resize(work)
-                work = work.resize((tgt_w, tgt_h), resample=Image.LANCZOS)  # type: ignore
+                im = im.resize((tgt_w, tgt_h), resample=Image.LANCZOS) #type: ignore
 
-            # PNG preserves transparency; keep working mode as-is
-            icc = im.info.get("icc_profile")  # carry over if present
+            rgb = to_jpeg_black_bg(im)
+
+            exif = im.info.get("exif")
+            icc = im.info.get("icc_profile")
 
             save_kwargs = {
-                "compress_level": compress_level,   # 0..9
-                "optimize": True,                   # palette/entropy optimizations where applicable
+                "quality": quality,
+                "optimize": True,
+                "progressive": True,
             }
+            if exif:
+                save_kwargs["exif"] = exif
             if icc:
                 save_kwargs["icc_profile"] = icc
 
-            work.save(output, SAVE_FORMAT, **save_kwargs)
+            rgb.save(output, SAVE_FORMAT, **save_kwargs)
 
         resized_note = f", resized to {tgt_w}x{tgt_h}" if (tgt_w, tgt_h) != (orig_w, orig_h) else ""
-        print(f"Converted {path} -> {output} (compress_level={compress_level}{resized_note})")
+        print(f"Converted {path} -> {output} (quality={quality}{resized_note})")
     except Exception as e:
         print(f"Failed to convert {path} or not a supported format: {e}")
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: convert_png.py <files...>")
+        print("Usage: convert.py <files...>")
         sys.exit(1)
 
-    compress_level, width, height = ask_compress_and_resize_gnome(default_compress=6)
-    if compress_level is None:
+    quality, width, height = ask_quality_and_resize_gnome(default_quality=95)
+    if quality is None:
         print("Cancelled by user.")
         sys.exit(0)
 
     for arg in sys.argv[1:]:
-        process(Path(arg), compress_level, width, height)
+        process(Path(arg), quality, width, height)
 
     if Notify is not None:
         try:
             size_msg = "original size" if (not width and not height) else (
-                f"{width or 'auto'}x{height or 'auto'}"
+                f"{width or 'auto'}×{height or 'auto'}"
             )
-            n = Notify.Notification.new(
-                "Conversion complete",
-                f"Compression: {compress_level}, Size: {size_msg}",
-                "image-x-generic"
-            )
+            n = Notify.Notification.new("Conversion complete", f"Quality: {quality}, Size: {size_msg}", "image-x-generic")
             n.show()
         except Exception:
             pass

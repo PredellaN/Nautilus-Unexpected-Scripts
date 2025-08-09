@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+venv_path = os.path.join(script_dir, 'venv', 'bin', 'python')
+sys.executable = venv_path
+
+import cv2
+import numpy as np
+from transformers import pipeline
+from PIL import Image
+from pathlib import Path
+
+### required: transformers, torchvision, scikit-image, opencv-python-headless, pillow, numpy
+
+def main(file_arg):
+    # 1) Initialize your segmentation pipeline
+    pipe = pipeline(
+        "image-segmentation",
+        model="briaai/RMBG-1.4",
+        trust_remote_code=True
+    )
+
+    # 2) Open input and set up output
+    input_path = Path(file_arg)
+    output_path = os.path.join(input_path.parent, input_path.stem + "_converted" + input_path.suffix)
+    output_path = "/home/nicolas/Downloads/test_video_out.mp4"
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video {input_path}")
+
+    # Get properties to configure writer
+    fps    = cap.get(cv2.CAP_PROP_FPS)
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # FourCC for MP4
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out    = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    # Pre-define magenta background
+    magenta_bgr = np.array([255, 0, 255], dtype=np.uint8)
+
+    # 3) Process frame by frame
+    frame_idx = 0
+    while True:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+
+        # Convert BGR→RGB, then to PIL
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_frame = Image.fromarray(frame_rgb)
+
+        # Run RMBG to get mask
+        # This returns a PIL mask image (mode="L") where 255=foreground
+        mask_pil = pipe(pil_frame, return_mask=True)
+        mask = np.array(mask_pil)  # H×W, values 0 or 255
+
+        # Build boolean mask
+        fg = (mask > 128)[..., None]  # H×W×1 boolean
+
+        # Apply to original frame
+        # frame_bgr[h,w,:] where fg=True; magenta where fg=False
+        comp = np.where(fg, frame_bgr, magenta_bgr)
+
+        # Write composited frame
+        out.write(comp)
+
+        frame_idx += 1
+        if frame_idx % 50 == 0:
+            print(f"Processed {frame_idx} frames…")
+
+    cap.release()
+    out.release()
+    print("Done! Output saved to", output_path)
+
+if __name__ == "__main__":
+    # for file_arg in sys.argv[1:]:
+    #     main(file_arg)
+    main('/home/nicolas/Downloads/PXL_20240123_193429048.mp4')

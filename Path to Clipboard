@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+from gi.repository import Notify #type: ignore
+
+# Get file paths from Nautilus environment variable
+paths_str = os.environ.get("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", "")
+files = paths_str.strip().split("\n") if paths_str else []
+
+# Copy paths to clipboard
+if files:
+    subprocess.run(
+        ["xclip", "-selection", "clipboard"],
+        input="\n".join(files).encode(),
+        check=True
+    )
+
+    # Initialize notifications
+    Notify.init("Path Copier")
+    notification = Notify.Notification.new(
+        "Copied to clipboard",
+        f"{len(files)} path(s)",
+        "edit-copy"  # optional icon name from icon theme
+    )
+    notification.show()

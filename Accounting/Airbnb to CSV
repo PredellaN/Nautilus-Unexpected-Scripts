@@ -92,7 +92,7 @@ def main(file_path):
         payout = reservation_data['Amount'].sum()
         service_fees = current_reservation['Service fee'].sum()
         cleaning_fees = current_reservation['Cleaning fee'].sum()
-        tax_unit_price = 0.89
+        tax_unit_price = 1.077
         tax_qty = adults * num_nights
         taxes = tax_qty * tax_unit_price
         reservation_total = current_reservation['Gross earnings'].sum() - cleaning_fees - taxes

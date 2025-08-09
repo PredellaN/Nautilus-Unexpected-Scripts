@@ -1,16 +1,36 @@
-#!/bin/bash
+#!/usr/bin/env python3
+import sys
+import subprocess
+from pathlib import Path
 
-format="heic"
-params="-define heic:preserve-alpha"
+FORMAT = "heic"
 
-for file in "$@"; do
-    filename="${file%.*}"
-    output="${filename}.${format}"
+def process(path: Path):
+    output = path.with_suffix(f".{FORMAT}")
+    try:
+        # heif-enc requires: heif-enc input -o output [params...]
+        cmd = ["heif-enc", str(path), "-o", str(output)]
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
-    if heif-enc $file -o $output; then
-        echo "Converted $file to $output"
-    else
-        echo "Failed to convert $file or not a supported format"
-    fi
-done
+        if result.returncode == 0:
+            print(f"Converted {path} to {output}")
+        else:
+            print(f"Failed to convert {path} or not a supported format")
+            if result.stderr:
+                print(result.stderr.strip())
+    except FileNotFoundError:
+        print("Error: heif-enc not found in PATH.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error processing {path}: {e}")
 
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <files...>")
+        sys.exit(1)
+
+    for arg in sys.argv[1:]:
+        process(Path(arg))
+
+if __name__ == "__main__":
+    main()
