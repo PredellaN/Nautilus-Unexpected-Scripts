@@ -3,24 +3,22 @@ import os
 import sys
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-venv_path = os.path.join(script_dir, 'venv', 'bin', 'python')
-sys.executable = venv_path
+deps_dir = os.path.join(script_dir, ".dependencies")
+sys.path.insert(0, deps_dir)
 
 from torchvision import transforms
-from transformers import pipeline, AutoModelForImageSegmentation
+from transformers import AutoModelForImageSegmentation
 import torch
 from pathlib import Path
 from PIL import Image
 
-### required: transformers, torchvision, scikit-image, opencv-python-headless, pillow, numpy, kornia, timm
-
-def main(file_arg):
+def process_file(file_arg):
 
     # 2) Open input and set up output
     input_path = Path(file_arg)
     output_path = os.path.join(input_path.parent, input_path.stem + "_converted.png")
 
-    model = AutoModelForImageSegmentation.from_pretrained('briaai/RMBG-2.0', trust_remote_code=True)
+    model = AutoModelForImageSegmentation.from_pretrained('ZhengPeng7/BiRefNet', trust_remote_code=True)
     torch.set_float32_matmul_precision(['high', 'highest'][0])
     model.to('cuda')
     model.eval()
@@ -34,7 +32,7 @@ def main(file_arg):
     ])
 
     image = Image.open(str(input_path))
-    input_images = transform_image(image).unsqueeze(0).to('cuda')
+    input_images = transform_image(image).unsqueeze(0).to('cuda') #type: ignore
 
     with torch.no_grad():
         preds = model(input_images)[-1].sigmoid().cpu()
@@ -45,7 +43,21 @@ def main(file_arg):
 
     image.save(output_path)
 
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <file1> [<file2> ...]")
+        sys.exit(1)
+    for file in sys.argv[1:]:
+        _ = process_file(file)
+
+        from gi.repository import Notify #type: ignore
+        Notify.init("Background Remover")
+        notification = Notify.Notification.new(
+            "Background removed",
+            f"{file}",
+            "edit-copy"  # optional icon name from icon theme
+        )
+        notification.show()
+
 if __name__ == "__main__":
-    # for file_arg in sys.argv[1:]:
-    #     main(file_arg)
-    main('/home/nicolas/Downloads/Omega-1-001/Omega/PXL_20230624_195809433.NIGHT.jpg')
+    main()

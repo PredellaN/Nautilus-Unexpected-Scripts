@@ -1,2 +1,3 @@
 .venv
-3d Conversion/.gmsh
+.continue/assistants/new-assistant.yaml
+.dependencies/

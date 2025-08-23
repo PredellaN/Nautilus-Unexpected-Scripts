@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import tempfile
+
+def img_to_svg(input_path):
+    base, _ = os.path.splitext(input_path)
+    output_path = base + ".svg"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pbm_path = os.path.join(tmpdir, "temp.pbm")
+
+        subprocess.run([
+            "convert", input_path,
+            "-alpha", "off",
+            "-threshold", "50%",
+            "-monochrome",
+            pbm_path
+        ], check=True)
+
+        subprocess.run([
+            "potrace", pbm_path,
+            "-s", "-o", output_path
+        ], check=True)
+
+    print(f"✅ {input_path} → {output_path}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: run.py <input1> <input2> ...")
+        sys.exit(1)
+
+    for arg in sys.argv[1:]:
+        if not os.path.isfile(arg):
+            print(f"Skipping {arg}: not a file")
+            continue
+        img_to_svg(arg)
+
