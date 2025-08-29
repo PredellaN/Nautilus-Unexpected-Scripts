@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+FREECAD_APPIMAGE = Path(__file__).parent / ".freecad.AppImage"
+
+def run(f: str):
+    input_file = Path(f)
+    output_file = os.path.join(input_file.parent, input_file.name + '.STL')
+
+    if not input_file.exists():
+        print(f"STEP file not found: {input_file}")
+        sys.exit(1)
+
+    if not FREECAD_APPIMAGE.exists():
+        print(f"FreeCAD AppImage not found: {FREECAD_APPIMAGE}")
+        sys.exit(1)
+
+    script = f"""
+import Part
+import MeshPart
+
+shape = Part.read("{input_file}")
+mesh = MeshPart.meshFromShape(Shape=shape, LinearDeflection=0.05, AngularDeflection=0.523599, Relative=False)
+mesh.write("{output_file}")
+"""
+
+    try:
+        subprocess.run([
+            str(FREECAD_APPIMAGE),
+            "--console",
+            "--python", "-",
+        ], input=script.encode(), check=True)
+    except subprocess.CalledProcessError as e:
+        print("FreeCAD failed to run:", e)
+        sys.exit(1)
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <file1> [<file2> ...]")
+        sys.exit(1)
+
+    for file in sys.argv[1:]:
+        _ = run(file)
+
+        from gi.repository import Notify #type: ignore
+        Notify.init("Converter")
+        notification = Notify.Notification.new(
+            "Converted",
+            f"{file}",
+            "edit-copy"  # optional icon name from icon theme
+        )
+        notification.show()
+
+if __name__ == "__main__":
+    main()

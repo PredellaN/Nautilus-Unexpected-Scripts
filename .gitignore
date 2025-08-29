@@ -1,3 +1,6 @@
 .venv
 .continue/assistants/new-assistant.yaml
 .dependencies/
+
+# Manually inserted deps
+3D/.freecad.AppImage
