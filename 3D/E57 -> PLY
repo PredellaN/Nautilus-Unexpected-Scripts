@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-import os
-import sys
-import struct
+import os, sys, site, struct
 import numpy as np
+
+script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+site.addsitedir(script_dir)
+from package_installer import install_deps_to_default_venv
+deps_dir = install_deps_to_default_venv(['pye57'])
+site.addsitedir(deps_dir)
+
 import pye57
 
 DEFAULT_COLOR = np.array([255, 255, 255], dtype=np.uint8)

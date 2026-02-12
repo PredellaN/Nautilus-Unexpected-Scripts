@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+import site
+import sys
+import os
+
+script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+site.addsitedir(script_dir)
+from package_installer import install_deps_to_default_venv
+deps_dir = install_deps_to_default_venv(['realesrgan_ncnn_py', ('pillow', 'PIL'), 'vulkan'])
+site.addsitedir(deps_dir)
+
+from PIL import Image
+from realesrgan_ncnn_py import Realesrgan
+
+def get_dedicated_gpu():
+    import vulkan as vk
+
+    # Initialize Vulkan
+    app_info = vk.VkApplicationInfo(
+        sType=vk.VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        pApplicationName='Vulkan GPU List',
+        applicationVersion=vk.VK_MAKE_VERSION(1, 0, 0),
+        pEngineName='No Engine',
+        engineVersion=vk.VK_MAKE_VERSION(1, 0, 0),
+        apiVersion=vk.VK_API_VERSION_1_0)
+
+    create_info = vk.VkInstanceCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        pApplicationInfo=app_info)
+
+    instance = vk.vkCreateInstance(create_info, None)
+
+    # Enumerate Physical Devices (GPUs)
+    physical_devices = vk.vkEnumeratePhysicalDevices(instance)
+
+    for i, device in enumerate(physical_devices):
+        properties = vk.vkGetPhysicalDeviceProperties(device)
+        if properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+            break  # Prioritize discrete GPUs
+        
+    vk.vkDestroyInstance(instance, None)
+    return i
+
+def run(image_paths):
+    # Initialize the Real-ESRGAN model (4x model in this case)
+    realesrgan = Realesrgan(gpuid=get_dedicated_gpu(), model=4)
+
+    for img_path in image_paths:
+        if not os.path.isfile(img_path):
+            print(f"Skipping {img_path}: not a valid file")
+            continue
+
+        try:
+            # Open input image
+            image = Image.open(img_path)
+
+            # Process with Real-ESRGAN
+            upscaled = realesrgan.process_pil(image) #type: ignore
+
+            # Apply 2/ resize (LANCZOS resampling)
+            final_width = upscaled.width #type: ignore
+            final_height = upscaled.height #type: ignore
+            final_upscaled = upscaled.resize((final_width, final_height), Image.Resampling.LANCZOS) #type: ignore
+
+            # Save result next to original
+            base, ext = os.path.splitext(img_path)
+            out_path = f"{base}_upscaled{ext}"
+            final_upscaled.save(out_path)
+
+            print(f"Saved upscaled image: {out_path}")
+        except Exception as e:
+            print(f"Error processing {img_path}: {e}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: run.py <input1> <input2> ...")
+        sys.exit(1)
+
+    run(sys.argv[1:])

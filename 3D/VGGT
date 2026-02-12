@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+import os, sys, site, glob, tempfile, shutil
+
+script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+## VGGT
+site.addsitedir(script_dir)
+
+from package_installer import install_repo, install_requirements
+deps_dir, repo_dir, pip = install_repo(repo="git@github.com:facebookresearch/vggt.git", folder="VGGT", deps=['trimesh', 'gradio', 'onnxruntime'])
+install_requirements(repo_dir)
+
+site.addsitedir(repo_dir)
+site.addsitedir(deps_dir)
+
+import torch
+from vggt.models.vggt import VGGT
+from vggt.utils.load_fn import load_and_preprocess_images
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.geometry import unproject_depth_map_to_point_map
+from visual_util import predictions_to_glb
+
+
+def run(images):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+    model.eval()
+
+    def run_model(target_dir, model) -> dict:
+        print(f"Processing images from {target_dir}")
+
+        # Device check
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA is not available. Check your environment.")
+
+        # Move model to device
+
+        model.to(device)
+        model.eval()
+
+        # Load and preprocess images
+        image_names = glob.glob(os.path.join(target_dir, 'images', "*"))
+        image_names = sorted(image_names)
+        print(f"Found {len(image_names)} images")
+        if len(image_names) == 0:
+            raise ValueError("No images found. Check your upload.")
+
+        images = load_and_preprocess_images(image_names).to(device)
+        print(f"Preprocessed images shape: {images.shape}")
+
+        # Run inference
+        print("Running inference...")
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+        with torch.no_grad():
+            with torch.amp.autocast(device ,dtype=dtype):
+                predictions = model(images)
+
+        # Convert pose encoding to extrinsic and intrinsic matrices
+        print("Converting pose encoding to extrinsic and intrinsic matrices...")
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+        predictions["extrinsic"] = extrinsic
+        predictions["intrinsic"] = intrinsic
+
+        # Convert tensors to numpy
+        for key in predictions.keys():
+            if isinstance(predictions[key], torch.Tensor):
+                predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension
+        predictions['pose_enc_list'] = None # remove pose_enc_list
+
+        # Generate world points from depth map
+        print("Computing world points from depth map...")
+        depth_map = predictions["depth"]  # (S, H, W, 1)
+        world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
+        predictions["world_points_from_depth"] = world_points
+
+        # Clean up
+        torch.cuda.empty_cache()
+        return predictions
+
+    # Create a temporary directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Copy all images into the temporary directory
+        os.mkdir(os.path.join(tmpdir, 'images'))
+        for i, img_path in enumerate(images):
+            shutil.copy(img_path, os.path.join(tmpdir, 'images', f"img_{i}{os.path.splitext(img_path)[1]}"))
+
+        # Run the model on the temporary directory
+        predictions = run_model(tmpdir, model)
+
+        # Convert predictions to GLB
+        glbscene = predictions_to_glb(
+            predictions,
+            conf_thres=3.0,
+            filter_by_frames="All",
+            mask_black_bg=True,
+            mask_white_bg=True,
+            show_cam=False,
+            mask_sky=True,
+            target_dir=tmpdir,
+            prediction_mode="Pointmap Regression",
+        )
+
+        # SAVE GLB
+        from pathlib import Path
+        glbfile = os.path.join(
+            os.path.dirname(Path(images[0])),
+            f"glbscene.glb",
+        )
+
+        glbscene.export(file_obj=glbfile)
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: run.py <input1> <input2> ...")
+        sys.exit(1)
+
+    run(sys.argv[1:])

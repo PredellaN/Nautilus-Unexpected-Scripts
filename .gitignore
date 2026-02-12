@@ -1,6 +1,11 @@
 .venv
 .continue/assistants/new-assistant.yaml
 .dependencies/
+.apps/
+__pycache__
 
 # Manually inserted deps
 3D/.freecad.AppImage
+.dependencies_static/depth_anything_v2/checkpoints/depth_anything_v2_vitl.pth
+
+skyseg.onnx

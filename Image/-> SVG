@@ -4,27 +4,34 @@ import sys
 import subprocess
 import tempfile
 
+# Requires: ImageMagick (convert) and potrace
+
 def img_to_svg(input_path):
     base, _ = os.path.splitext(input_path)
     output_path = base + ".svg"
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        pbm_path = os.path.join(tmpdir, "temp.pbm")
+        pbm_path = os.path.join(tmpdir, "mask.pbm")
 
+        # 1) Extract alpha as a black/white mask (white = opaque glyph)
+        # 2) Threshold to bilevel so Potrace gets a crisp mask
         subprocess.run([
             "convert", input_path,
-            "-alpha", "off",
+            "-alpha", "extract",
             "-threshold", "50%",
-            "-monochrome",
+            "-type", "bilevel",
             pbm_path
         ], check=True)
 
+        # Potrace traces black → foreground, but our mask is white-on-black,
+        # so invert (-i / --invert). Also set the SVG fill color to white.
         subprocess.run([
             "potrace", pbm_path,
-            "-s", "-o", output_path
+            "-s",                      # SVG output
+            "-i",                      # invert (white mask → black foreground)
+            "--color", "#ffffff",      # white fill in SVG
+            "-o", output_path
         ], check=True)
-
-    print(f"✅ {input_path} → {output_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

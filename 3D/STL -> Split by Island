@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+import sys, os, site
+
+script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+site.addsitedir(script_dir)
+from package_installer import install_deps_to_default_venv
+
+deps_dir = install_deps_to_default_venv(deps=["numpy", ("numpy-stl", "stl"), "tqdm"])
+site.addsitedir(deps_dir)
+
+import numpy as np
+from dataclasses import dataclass
+from stl import mesh as stl_mesh
+from tqdm import tqdm
+
+
+def load_stl_triangles(path: str) -> np.ndarray:
+    m = stl_mesh.Mesh.from_file(path)
+    return np.asarray(m.vectors, dtype=np.float64)  # (n_tris, 3, 3)
+
+
+def quantize(v: np.ndarray, eps: float) -> np.ndarray:
+    return np.round(v / eps).astype(np.int64)  # robust vertex deduping
+
+
+def unique_vertices_and_tris(tri_verts: np.ndarray, eps: float = 1e-8):
+    # tri_verts: (n_tris, 3, 3)
+    flat = tri_verts.reshape(-1, 3)  # (3*n_tris, 3)
+    q = quantize(flat, eps)
+
+    # structured view for np.unique on rows
+    q_view = q.view([("x", np.int64), ("y", np.int64), ("z", np.int64)]).reshape(-1)
+    uniq_view, inv = np.unique(q_view, return_inverse=True)
+
+    uniq_count = uniq_view.shape[0]
+    sums = np.zeros((uniq_count, 3), dtype=np.float64)
+    counts = np.zeros(uniq_count, dtype=np.int64)
+    np.add.at(sums, inv, flat)      # accumulate original floats
+    np.add.at(counts, inv, 1)
+
+    vertices = sums / counts[:, None]                 # (n_verts, 3)
+    triangles = inv.reshape(-1, 3).astype(np.int64)   # (n_tris, 3)
+    return vertices, triangles
+
+
+@dataclass
+class UnionFind:
+    parent: np.ndarray
+    rank: np.ndarray
+
+    @classmethod
+    def create(cls, n: int):
+        return cls(np.arange(n, dtype=np.int64), np.zeros(n, dtype=np.int8))
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        pa, pb = self.find(a), self.find(b)
+        if pa == pb:
+            return
+        ra, rb = self.rank[pa], self.rank[pb]
+        if ra < rb:
+            self.parent[pa] = pb
+        elif ra > rb:
+            self.parent[pb] = pa
+        else:
+            self.parent[pb] = pa
+            self.rank[pa] = ra + 1
+
+
+def compute_vertex_islands(tris: np.ndarray, n_verts: int, progress: bool = True, batch_size: int = 250_000):
+    uf = UnionFind.create(n_verts)
+
+    n_tris = tris.shape[0]
+    it = range(0, n_tris, batch_size)
+    if progress:
+        it = tqdm(it, desc="Union-Find (triangle batches)", unit="batch")
+
+    for s in it:
+        t = tris[s : s + batch_size]  # (b,3)
+
+        a, b, c = t[:, 0], t[:, 1], t[:, 2]
+        edges = np.empty((t.shape[0] * 3, 2), dtype=np.int64)
+        edges[0 : t.shape[0], 0] = a
+        edges[0 : t.shape[0], 1] = b
+        edges[t.shape[0] : 2 * t.shape[0], 0] = b
+        edges[t.shape[0] : 2 * t.shape[0], 1] = c
+        edges[2 * t.shape[0] : 3 * t.shape[0], 0] = c
+        edges[2 * t.shape[0] : 3 * t.shape[0], 1] = a
+
+        edges.sort(axis=1)
+        edges = np.unique(edges, axis=0)
+
+        for u, v in edges:
+            uf.union(int(u), int(v))
+
+    roots = np.empty(n_verts, dtype=np.int64)
+    idx_it = range(n_verts)
+    if progress and n_verts > 200_000:
+        idx_it = tqdm(idx_it, desc="Compress / find roots", unit="vtx")
+    for i in idx_it:
+        roots[i] = uf.find(i)
+
+    _, island_ids = np.unique(roots, return_inverse=True)  # contiguous 0..k-1
+    return island_ids.astype(np.int64)
+
+
+def export_islands_as_obj(
+    out_path: str,
+    vertices: np.ndarray,          # (n_verts, 3) float64
+    triangles: np.ndarray,         # (n_tris, 3) int64, 0-based
+    island_per_vertex: np.ndarray, # (n_verts,) int64
+    progress: bool = True,
+):
+    # Assign each triangle to an island (any vertex works because islands are by connectivity)
+    tri_island = island_per_vertex[triangles[:, 0]]
+    n_islands = int(tri_island.max() + 1) if tri_island.size else 0
+
+    # Sort triangles by island to get contiguous blocks (fast export)
+    order = np.argsort(tri_island, kind="mergesort")  # stable
+    tri_sorted = triangles[order]
+    isl_sorted = tri_island[order]
+
+    # Find block boundaries for each island in the sorted triangle list
+    # starts: indices where a new island begins
+    if tri_sorted.shape[0] == 0:
+        starts = np.array([0], dtype=np.int64)
+        ends = np.array([0], dtype=np.int64)
+        island_ids_in_order = np.array([], dtype=np.int64)
+    else:
+        change = np.flatnonzero(isl_sorted[1:] != isl_sorted[:-1]) + 1
+        starts = np.concatenate(([0], change))
+        ends = np.concatenate((change, [tri_sorted.shape[0]]))
+        island_ids_in_order = isl_sorted[starts]
+
+    # Write OBJ efficiently:
+    # - vertices written once (global indexing)
+    # - each island as a separate object 'o'
+    with open(out_path, "w", buffering=1024 * 1024) as f:
+        f.write("# Split STL islands -> OBJ\n")
+        f.write(f"# vertices: {vertices.shape[0]}\n")
+        f.write(f"# triangles: {triangles.shape[0]}\n")
+        f.write(f"# objects: {n_islands}\n\n")
+
+        # v lines (C-accelerated formatting)
+        # Using a 1-column fmt string is fastest; np.savetxt writes line by line in C.
+        np.savetxt(f, vertices, fmt="v %.10g %.10g %.10g")
+
+        f.write("\n")
+
+        it = range(starts.shape[0])
+        if progress:
+            it = tqdm(it, desc="Export OBJ objects", unit="object")
+
+        # Faces are written in big blocks via np.savetxt as well (no per-face python loop)
+        # OBJ face indices are 1-based.
+        face_fmt = ["f %d", "%d", "%d"]
+        for bi in it:
+            isl_id = int(island_ids_in_order[bi])
+            s, e = int(starts[bi]), int(ends[bi])
+            if s == e:
+                continue
+
+            f.write(f"o island_{isl_id + 1}\n")
+            faces = tri_sorted[s:e] + 1  # 1-based
+            np.savetxt(f, faces, fmt=face_fmt, delimiter=" ")
+            f.write("\n")
+
+
+def process_and_export_obj(stl_path: str, eps: float = 1e-8, out_obj_path: str | None = None, progress: bool = True):
+    tri_verts = load_stl_triangles(stl_path)                 # (n_tris, 3, 3)
+    vertices, triangles = unique_vertices_and_tris(tri_verts, eps)
+
+    island_per_vertex = compute_vertex_islands(triangles, len(vertices), progress=progress)
+
+    if out_obj_path is None:
+        root, _ = os.path.splitext(stl_path)
+        out_obj_path = root + "_islands.obj"
+
+    export_islands_as_obj(out_obj_path, vertices, triangles, island_per_vertex, progress=progress)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python split_stl_islands_to_obj.py input.stl [eps] [out.obj] [--no-progress]")
+        raise SystemExit(2)
+
+    stl_path = sys.argv[1]
+    eps = float(sys.argv[2]) if len(sys.argv) >= 3 and not sys.argv[2].startswith("--") else 1e-8
+    out_obj = sys.argv[3] if len(sys.argv) >= 4 and not sys.argv[3].startswith("--") else None
+    progress = ("--no-progress" not in sys.argv)
+
+    process_and_export_obj(stl_path, eps=eps, out_obj_path=out_obj, progress=progress)

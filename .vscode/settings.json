@@ -2,6 +2,10 @@
     "python.languageServer": "None",
     "basedpyright.analysis.diagnosticMode": "workspace",
     "basedpyright.analysis.extraPaths": [
-        ".dependencies"
+        ".apps",
+        ".apps/depthanything3",
+        ".apps/depthanything3/.venv/lib/python3.10/site-packages",
+        ".apps/vggt",
+        ".apps/vggt/.venv/lib/python3.10/site-packages"
     ]
 }

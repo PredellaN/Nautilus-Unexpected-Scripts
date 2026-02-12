@@ -1,0 +1,18 @@
+{
+  "executionEnvironments": [
+    {
+      "root": ".apps/depth-anything-3",
+      "extraPaths": [
+        ".apps/depthanything3",
+        ".apps/depthanything3/.venv/lib/python3.11/site-packages"
+      ]
+    },
+    {
+      "root": ".apps/vggt",
+      "extraPaths": [
+        ".apps/vggt",
+        ".apps/vggt/.venv/lib/python3.11/site-packages"
+      ]
+    }
+  ]
+}

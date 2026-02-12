@@ -1,70 +1,88 @@
 #!/usr/bin/env python3
-import os
-import sys
+import os, sys, site
+import json
+import threading
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-deps_dir = os.path.join(script_dir, ".dependencies")
-sys.path.insert(0, deps_dir)
+site.addsitedir(script_dir)
+from package_installer import install_deps_to_default_venv
+deps_dir = install_deps_to_default_venv(deps=["torch", "torchaudio"], params=["--index-url", "https://download.pytorch.org/whl/cu121"])
+deps_dir = install_deps_to_default_venv(deps=['demucs', 'mutagen', 'stempeg'])
+site.addsitedir(deps_dir)
 
-from pathlib import Path
 import numpy as np
 import torch
+
 from demucs import pretrained
 from demucs.apply import apply_model
 
-## requirements: stempeg, gpac
-from torchcodec.decoders import AudioDecoder
-def load_audio_stereo_441(input_path):
-    decoder = AudioDecoder(input_path)
-    wav = decoder.get_all_samples()  # shape: (num_channels, num_frames)
-    sr = wav.sample_rate
-    return wav, sr
+def load_audio_stereo_441(input_path: str):
+    import subprocess
 
+    sr = 44100
+    cmd = [
+        "ffmpeg",
+        "-v", "error",
+        "-i", input_path,
+        "-ac", "2",
+        "-ar", str(sr),
+        "-f", "f32le",
+        "-acodec", "pcm_f32le",
+        "pipe:1",
+    ]
+    raw = subprocess.check_output(cmd)
+    audio = np.frombuffer(raw, dtype=np.float32)
+    if audio.size == 0:
+        raise RuntimeError(f"ffmpeg returned no audio samples for: {input_path}")
+
+    # interleaved stereo -> (frames, 2) -> torch (2, frames)
+    audio = audio.reshape(-1, 2)
+    mix_wave = torch.from_numpy(audio.T.copy())  # (2, frames)
+    return mix_wave, sr
 
 def _to_numpy_stems(stems_torch: torch.Tensor):
-    """(S, C, T) torch -> (S, T, C) float32 numpy with peak-safe scaling."""
     data = stems_torch.permute(0, 2, 1).contiguous().cpu().numpy().astype("float32")
     peak = np.max(np.abs(data), axis=(1, 2), keepdims=True)
     peak[peak < 1e-9] = 1.0
     return data / np.maximum(peak * 1.01, 1.0)
 
-def _separate_demucs(mix_wave: torch.Tensor, model_name: str = "htdemucs"):
-    """Return dict for {'drums','bass','other','vocals'} with arrays shaped (T, C)."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = pretrained.get_model(model_name).to(device)
-    with torch.no_grad():
-        stems = apply_model(model, mix_wave.to(device)[None, ...], device=device, split=True, overlap=0.25)[0]
-    names = getattr(model, "sources", ["drums", "bass", "other", "vocals"])
-    data = _to_numpy_stems(stems)  # (S, T, C)
-    return {name: data[i] for i, name in enumerate(names)}
-
+def _read_tags(path: Path):
+    title = artist = album = track = None
+    try:
+        from mutagen import File as MFile
+        mf = MFile(str(path), easy=True)
+        if mf:
+            title = (mf.get("title") or [None])[0]
+            artist = (mf.get("artist") or [None])[0]
+            album = (mf.get("album") or [None])[0]
+            track = (mf.get("tracknumber") or mf.get("track") or [None])[0]
+    except Exception:
+        pass
+    return title, artist, album, track
 
 def _write_traktor_stem(out_path: str, mix_np, stems_dict, sample_rate: int, title: str,
-                        artist: str | None = None, album: str | None = None, cover_path: str | None = None):
-    import json
-    import os
-    import numpy as np
+                        artist: str | None = None, album: str | None = None,
+                        tracknumber: str | None = None, cover_path: str | None = None):
     import stempeg
 
-    # 1) NI order: mix, drums, bass, other, vocals  -> (5, samples, channels)
     data = np.stack(
         [mix_np, stems_dict["drums"], stems_dict["bass"], stems_dict["other"], stems_dict["vocals"]],
         axis=0
     ).astype("float32")
 
-    # 2) Build default metadata **dict**
-    with open(stempeg.default_metadata()) as f:  # this returns a path; load JSON into a dict
+    with open(stempeg.default_metadata()) as f:
         meta = json.load(f)
-    meta["title"] = title
-    if artist:
-        meta["artist"] = artist
-    if album:
-        meta["album"] = album
+
+    if title:  meta["title"] = title
+    if artist: meta["artist"] = artist
+    if album:  meta["album"] = album
+    if tracknumber: meta["tracknumber"] = str(tracknumber)
     if cover_path and os.path.exists(cover_path):
         with open(cover_path, "rb") as cf:
-            meta["cover"] = cf.read()  # bytes
+            meta["cover"] = cf.read()
 
-    # 3) Per-stem tags (names/colors) for Traktor UI
     stems_meta = [
         {"name": "drums",  "color": "#F0E442"},
         {"name": "bass",   "color": "#56B4E9"},
@@ -72,7 +90,6 @@ def _write_traktor_stem(out_path: str, mix_np, stems_dict, sample_rate: int, tit
         {"name": "vocals", "color": "#D55E00"},
     ]
 
-    # 4) Create NI writer with dict metadata; do NOT pass metadata to write_stems
     writer = stempeg.NIStemsWriter(
         default_metadata=meta,
         stems_metadata=stems_meta,
@@ -81,43 +98,102 @@ def _write_traktor_stem(out_path: str, mix_np, stems_dict, sample_rate: int, tit
         output_sample_rate=44100,
     )
 
-    # 5) Write using the documented signature
-    stempeg.write_stems(
-        path=str(out_path),
-        data=data,
-        sample_rate=sample_rate,
-        writer=writer, #type: ignore
-    )
+    stempeg.write_stems(path=str(out_path), data=data, sample_rate=sample_rate, writer=writer)  # type: ignore
 
-def process_file(file_path: str, model_name: str = "htdemucs"):
+# ---------- GPU serialization & model cache ----------
+
+_GPU_SEM = threading.Semaphore(1)        # allow exactly one GPU job at a time
+_MODEL_CACHE_LOCK = threading.Lock()
+_MODEL_CACHE: dict[str, torch.nn.Module] = {}
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = pretrained.get_model("htdemucs").to(_DEVICE).eval()
+
+def _separate_demucs_serial(mix_wave: torch.Tensor, model_name: str = "htdemucs"):
+    """
+    This function is GPU-serialized. It acquires a semaphore so only one thread
+    runs inference at a time. Model is cached across calls.
+    """
+    _GPU_SEM.acquire()
+    try:
+        with torch.no_grad():
+            stems = apply_model(
+                model,
+                mix_wave.to(_DEVICE)[None, ...],
+                device=_DEVICE,
+                split=True,
+                overlap=0.25
+            )[0]
+        names = getattr(model, "sources", ["drums", "bass", "other", "vocals"])
+        data = _to_numpy_stems(stems)
+        return {name: data[i] for i, name in enumerate(names)}
+    finally:
+        _GPU_SEM.release()
+
+# ---------- Per-file pipeline (CPU → GPU → CPU) ----------
+
+def process_file(file_path: str, model_name: str = "htdemucs") -> Path:
     src = Path(file_path)
     if not src.exists():
         raise FileNotFoundError(f"{src} not found")
 
-    mix_wave, sr = load_audio_stereo_441(str(src))                # torch (2, T), sr = 44100
-    mix_np = mix_wave.data.permute(1, 0).contiguous().numpy().astype("float32")  # (T, C)
+    # CPU-bound: decode & tag read
+    mix_wave, sr = load_audio_stereo_441(str(src))
+    # shape to (frames, channels) float32 numpy for writing later
+    mix_np = mix_wave.data.permute(1, 0).contiguous().cpu().numpy().astype("float32")
+    t, a, al, tn = _read_tags(src)
 
-    stems = _separate_demucs(mix_wave.data, model_name=model_name)
+    # GPU-serialized: separation
+    stems = _separate_demucs_serial(mix_wave, model_name=model_name)
 
+    # CPU-bound: encode/write stems
     out = src.with_suffix(".stem.m4a")
-    _write_traktor_stem(str(out), mix_np=mix_np, stems_dict=stems, sample_rate=sr, title=src.stem)
+    _write_traktor_stem(
+        str(out),
+        mix_np=mix_np,
+        stems_dict=stems,
+        sample_rate=sr,
+        title=t or src.stem,
+        artist=a,
+        album=al,
+        tracknumber=tn,
+    )
     return out
+
+# ---------- CLI with CPU parallelism ----------
+
+def _notify_done(path_str: str):
+    try:
+        from gi.repository import Notify  # type: ignore
+        Notify.init("STEM Separator")
+        notification = Notify.Notification.new("Separated STEMs", path_str, "edit-copy")
+        notification.show()
+    except Exception:
+        # Notifications are best-effort; avoid crashing if GI isn't available/thread-safe
+        pass
 
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <file1> [<file2> ...]")
         sys.exit(1)
-    for file in sys.argv[1:]:
-        _ = process_file(file)
 
-        from gi.repository import Notify #type: ignore
-        Notify.init("STEM Separator")
-        notification = Notify.Notification.new(
-            "Separated STEMs",
-            f"{file}",
-            "edit-copy"  # optional icon name from icon theme
-        )
-        notification.show()
+    files = sys.argv[1:]
+    # Thread pool sizes ~ number of CPU cores to maximize CPU-bound overlap
+    max_workers = max(1, os.cpu_count() or 1)
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="stemcpu") as ex:
+        for f in files:
+            futures.append(ex.submit(process_file, f))
+
+        # Collect results as they finish; send notifications from the main thread
+        for fut in as_completed(futures):
+            try:
+                out_path = fut.result()
+                print(f"Done: {out_path}")
+                _notify_done(str(out_path))
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
