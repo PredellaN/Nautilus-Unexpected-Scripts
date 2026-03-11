@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+import os
+import sys
+import site
+import json
+import shutil
+import tempfile
+import subprocess
+import threading
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+site.addsitedir(script_dir)
+
+from package_installer import install_deps_to_default_venv
+
+# Install deps
+deps_dir = install_deps_to_default_venv(
+    deps=["torch", "torchaudio"],
+    params=["--index-url", "https://download.pytorch.org/whl/cu121"],
+)
+site.addsitedir(deps_dir)
+
+deps_dir = install_deps_to_default_venv(
+    deps=["bs-roformer-infer", "mutagen", "stempeg", "soundfile", "pyyaml", "ml_collections"]
+)
+site.addsitedir(deps_dir)
+
+# Make the venv's console-scripts visible to subprocesses.
+# If deps_dir is .../venv/lib/pythonX.Y/site-packages, scripts live in .../venv/bin
+deps_site = Path(deps_dir).resolve()
+venv_root = deps_site.parent.parent.parent
+venv_bin = venv_root / ("Scripts" if os.name == "nt" else "bin")
+
+if venv_bin.exists():
+    os.environ["PATH"] = str(venv_bin) + os.pathsep + os.environ.get("PATH", "")
+
+def _find_executable(name: str) -> str:
+    path = shutil.which(name)
+    if path:
+        return path
+    raise FileNotFoundError(
+        f"Could not find '{name}' on PATH. "
+        f"Tried PATH={os.environ.get('PATH', '')}"
+    )
+
+BSR_DOWNLOAD_EXE = _find_executable("bs-roformer-download")
+BSR_INFER_EXE = _find_executable("bs-roformer-infer")
+
+import numpy as np
+import soundfile as sf
+
+# ----------------------------
+# Audio / metadata helpers
+# ----------------------------
+
+def load_audio_stereo_441_numpy(input_path: str):
+    sr = 44100
+    cmd = [
+        "ffmpeg",
+        "-v", "error",
+        "-i", input_path,
+        "-ac", "2",
+        "-ar", str(sr),
+        "-f", "f32le",
+        "-acodec", "pcm_f32le",
+        "pipe:1",
+    ]
+    raw = subprocess.check_output(cmd)
+    audio = np.frombuffer(raw, dtype=np.float32)
+    if audio.size == 0:
+        raise RuntimeError(f"ffmpeg returned no audio samples for: {input_path}")
+
+    # interleaved stereo -> (frames, 2)
+    audio = audio.reshape(-1, 2).astype("float32", copy=False)
+    return audio, sr
+
+
+def _read_tags(path: Path):
+    title = artist = album = track = None
+    try:
+        from mutagen import File as MFile
+        mf = MFile(str(path), easy=True)
+        if mf:
+            title = (mf.get("title") or [None])[0]
+            artist = (mf.get("artist") or [None])[0]
+            album = (mf.get("album") or [None])[0]
+            track = (mf.get("tracknumber") or mf.get("track") or [None])[0]
+    except Exception:
+        pass
+    return title, artist, album, track
+
+
+def _normalize_np(audio: np.ndarray) -> np.ndarray:
+    audio = np.asarray(audio, dtype=np.float32)
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak < 1e-9:
+        return audio
+    return audio / max(peak * 1.01, 1.0)
+
+
+def _read_wav_stereo_441(path: Path) -> np.ndarray:
+    data, sr = sf.read(str(path), always_2d=True, dtype="float32")
+    if sr != 44100:
+        raise RuntimeError(f"Expected 44100 Hz stem, got {sr} for {path}")
+    if data.shape[1] == 1:
+        data = np.repeat(data, 2, axis=1)
+    elif data.shape[1] != 2:
+        raise RuntimeError(f"Expected mono/stereo WAV, got shape {data.shape} for {path}")
+    return data.astype("float32", copy=False)
+
+
+def _write_traktor_stem(
+    out_path: str,
+    mix_np: np.ndarray,
+    stems_dict: dict[str, np.ndarray],
+    sample_rate: int,
+    title: str,
+    artist: str | None = None,
+    album: str | None = None,
+    tracknumber: str | None = None,
+    cover_path: str | None = None,
+):
+    import json
+    import os
+    import numpy as np
+    import stempeg
+    from mutagen.mp4 import MP4, MP4Cover
+
+    data = np.stack(
+        [
+            mix_np,
+            stems_dict["drums"],
+            stems_dict["bass"],
+            stems_dict["other"],
+            stems_dict["vocals"],
+        ],
+        axis=0,
+    ).astype("float32")
+
+    with open(stempeg.default_metadata()) as f:
+        meta = json.load(f)
+
+    stems_meta = [
+        {"name": "drums",  "color": "#F0E442"},
+        {"name": "bass",   "color": "#56B4E9"},
+        {"name": "other",  "color": "#009E73"},
+        {"name": "vocals", "color": "#D55E00"},
+    ]
+
+    writer = stempeg.NIStemsWriter(
+        default_metadata=meta,
+        stems_metadata=stems_meta,
+        codec="aac",
+        bitrate=256000,
+        output_sample_rate=44100,
+    )
+
+    stempeg.write_stems(
+        path=str(out_path),
+        data=data,
+        sample_rate=sample_rate,
+        writer=writer,
+    )
+
+    # Patch standard MP4 tags after writing
+    audio = MP4(str(out_path))
+
+    if title:
+        audio["\xa9nam"] = [title]
+    if artist:
+        audio["\xa9ART"] = [artist]
+    if album:
+        audio["\xa9alb"] = [album]
+    if tracknumber:
+        try:
+            audio["trkn"] = [(int(tracknumber), 0)]
+        except ValueError:
+            pass
+
+    if cover_path and os.path.exists(cover_path):
+        with open(cover_path, "rb") as cf:
+            cover_data = cf.read()
+        fmt = MP4Cover.FORMAT_PNG if cover_path.lower().endswith(".png") else MP4Cover.FORMAT_JPEG
+        audio["covr"] = [MP4Cover(cover_data, imageformat=fmt)]
+
+    audio.save()
+
+
+# ----------------------------
+# BS-RoFormer model management
+# ----------------------------
+
+# Documented recommended multi-stem model in bs-roformer-infer:
+# roformer-model-bs-roformer-sw-by-jarredou
+BSR_MODEL_SLUG = "roformer-model-bs-roformer-sw-by-jarredou"
+BSR_CONFIG_NAME = "BS-Rofo-SW-Fixed.yaml"
+BSR_CKPT_NAME = "BS-Rofo-SW-Fixed.ckpt"
+
+_MODEL_SETUP_LOCK = threading.Lock()
+_MODEL_DIR: Path | None = None
+
+# Only one GPU job at a time, same idea as your Demucs script.
+_GPU_SEM = threading.Semaphore(1)
+
+
+def _ensure_bs_roformer_model() -> tuple[Path, Path]:
+    global _MODEL_DIR
+
+    with _MODEL_SETUP_LOCK:
+        if _MODEL_DIR is not None:
+            config_path = _MODEL_DIR / BSR_CONFIG_NAME
+            ckpt_path = _MODEL_DIR / BSR_CKPT_NAME
+            if config_path.exists() and ckpt_path.exists():
+                return config_path, ckpt_path
+
+        # Use a stable cache location
+        cache_root = Path.home() / ".cache" / "bs_roformer_models"
+        model_dir = cache_root / BSR_MODEL_SLUG
+        config_path = model_dir / BSR_CONFIG_NAME
+        ckpt_path = model_dir / BSR_CKPT_NAME
+
+        if not (config_path.exists() and ckpt_path.exists()):
+            model_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call([
+                BSR_DOWNLOAD_EXE,
+                "--model", BSR_MODEL_SLUG,
+                "--output-dir", str(cache_root),
+            ])
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"Missing config after download: {config_path}")
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Missing checkpoint after download: {ckpt_path}")
+
+        _MODEL_DIR = model_dir
+        return config_path, ckpt_path
+
+
+def _find_generated_stem_file(folder: Path, suffix: str) -> Path:
+    matches = list(folder.glob(f"*_{suffix}.wav"))
+    if not matches:
+        raise FileNotFoundError(f"No generated '*_{suffix}.wav' in {folder}")
+    if len(matches) > 1:
+        matches.sort()
+    return matches[0]
+
+
+def _separate_bs_roformer_serial(src_path: Path) -> dict[str, np.ndarray]:
+    """
+    Runs CLI inference because the bs-roformer-infer README clearly documents
+    install/download/CLI usage for the recommended multi-stem model.
+    """
+    config_path, ckpt_path = _ensure_bs_roformer_model()
+
+    _GPU_SEM.acquire()
+    try:
+        with tempfile.TemporaryDirectory(prefix="bsr_input_") as in_tmp, \
+             tempfile.TemporaryDirectory(prefix="bsr_out_") as out_tmp:
+            in_dir = Path(in_tmp)
+            out_dir = Path(out_tmp)
+
+            # Inference toolkit expects WAVs in an input folder.
+            staged = in_dir / (src_path.stem + ".wav")
+            subprocess.check_call([
+                "ffmpeg",
+                "-v", "error",
+                "-y",
+                "-i", str(src_path),
+                "-ac", "2",
+                "-ar", "44100",
+                str(staged),
+            ])
+
+            cmd = [
+                BSR_INFER_EXE,
+                "--config_path", str(config_path),
+                "--model_path", str(ckpt_path),
+                "--input_folder", str(in_dir),
+                "--store_dir", str(out_dir),
+            ]
+            subprocess.check_call(cmd)
+
+            vocals = _read_wav_stereo_441(_find_generated_stem_file(out_dir, "vocals"))
+            drums = _read_wav_stereo_441(_find_generated_stem_file(out_dir, "drums"))
+            bass = _read_wav_stereo_441(_find_generated_stem_file(out_dir, "bass"))
+
+            # Traktor wants one "other" stem.
+            other_parts = []
+            for name in ("other", "guitar", "piano"):
+                try:
+                    other_parts.append(_read_wav_stereo_441(_find_generated_stem_file(out_dir, name)))
+                except FileNotFoundError:
+                    pass
+
+            if not other_parts:
+                raise FileNotFoundError("BS-RoFormer output did not include other/guitar/piano stems")
+
+            # Sum non-vocal melodic leftovers into Traktor's single "other" bus
+            max_len = max(x.shape[0] for x in other_parts)
+            padded = []
+            for x in other_parts:
+                if x.shape[0] < max_len:
+                    pad = np.zeros((max_len - x.shape[0], 2), dtype=np.float32)
+                    x = np.vstack([x, pad])
+                padded.append(x)
+            other = np.sum(padded, axis=0, dtype=np.float32)
+
+            return {
+                "vocals": _normalize_np(vocals),
+                "drums": _normalize_np(drums),
+                "bass": _normalize_np(bass),
+                "other": _normalize_np(other),
+            }
+    finally:
+        _GPU_SEM.release()
+
+
+# ----------------------------
+# Per-file pipeline
+# ----------------------------
+
+def process_file(file_path: str) -> Path:
+    src = Path(file_path)
+    if not src.exists():
+        raise FileNotFoundError(f"{src} not found")
+
+    mix_np, sr = load_audio_stereo_441_numpy(str(src))
+    t, a, al, tn = _read_tags(src)
+
+    stems = _separate_bs_roformer_serial(src)
+
+    out = src.with_suffix(".stem.m4a")
+    _write_traktor_stem(
+        str(out),
+        mix_np=mix_np,
+        stems_dict=stems,
+        sample_rate=sr,
+        title=t or src.stem,
+        artist=a,
+        album=al,
+        tracknumber=tn,
+    )
+    return out
+
+
+# ----------------------------
+# Notifications / CLI
+# ----------------------------
+
+def _notify_done(path_str: str):
+    try:
+        from gi.repository import Notify  # type: ignore
+        Notify.init("STEM Separator")
+        notification = Notify.Notification.new("Separated STEMs", path_str, "edit-copy")
+        notification.show()
+    except Exception:
+        pass
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <file1> [<file2> ...]")
+        sys.exit(1)
+
+    files = sys.argv[1:]
+    max_workers = max(1, os.cpu_count() or 1)
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="stemcpu") as ex:
+        for f in files:
+            futures.append(ex.submit(process_file, f))
+
+        for fut in as_completed(futures):
+            try:
+                out_path = fut.result()
+                print(f"Done: {out_path}")
+                _notify_done(str(out_path))
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

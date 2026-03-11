@@ -8,7 +8,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "/home/nicolas/Pictures/Screenshots/castle.png"
+                "/home/nicolas/Music/Mixxx/mixxxdb-beta.sqlite"
             ]
         }
     ]
