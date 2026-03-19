@@ -273,7 +273,7 @@ def _separate_bs_roformer_serial(src_path: Path) -> dict[str, np.ndarray]:
                 str(staged),
             ])
 
-            cmd = [
+            cmd: list[str] = [
                 BSR_INFER_EXE,
                 "--config_path", str(config_path),
                 "--model_path", str(ckpt_path),
